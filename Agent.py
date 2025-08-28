@@ -1,508 +1,637 @@
 import os
-import json
-import hashlib
-from pathlib import Path
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-import chromadb
 import numpy as np
-from sentence_transformers import SentenceTransformer
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
-model_name = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-medium")
-
+import torch.nn as nn
+import torch.nn.functional as F
 from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
-    pipeline,
-    BitsAndBytesConfig
+    AutoTokenizer, AutoModel, AutoModelForCausalLM,
+    pipeline
 )
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import PyPDF2
-from docx import Document
-import warnings
-warnings.filterwarnings("ignore")
+from sentence_transformers import SentenceTransformer
+import faiss
+import pickle
+import json
+from typing import List, Dict, Tuple, Optional
+import pyttsx3
+from gtts import gTTS
+import io
+import pygame
+import threading
+from datetime import datetime
+import logging
 
-class LocalEmbeddingFunction:
-    """Custom embedding function using sentence-transformers"""
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class DocumentStore:
+    """Handles document storage and retrieval for RAG with Mistral tokenization"""
     
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """Initialize with a local sentence transformer model"""
-        print(f"Loading embedding model: {model_name}")
-        self.model = SentenceTransformer(model_name)
+    def __init__(self, 
+                 embedding_model_name: str = "all-MiniLM-L6-v2",
+                 mistral_model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"):
+        self.embedding_model = SentenceTransformer(embedding_model_name)
         
-    def __call__(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for a list of texts"""
-        embeddings = self.model.encode(texts, convert_to_numpy=True)
-        return embeddings.tolist()
+        # Load Mistral tokenizer for consistent text processing
+        self.mistral_tokenizer = AutoTokenizer.from_pretrained(mistral_model_name)
+        if self.mistral_tokenizer.pad_token is None:
+            self.mistral_tokenizer.pad_token = self.mistral_tokenizer.eos_token
+            
+        self.documents = []
+        self.document_metadata = []
+        self.embeddings = None
+        self.index = None
+        
+        logger.info(f"DocumentStore initialized with {embedding_model_name} embeddings and {mistral_model_name} tokenizer")
+        
+    def add_documents(self, documents: List[str], metadata: Optional[List[Dict]] = None):
+        """Add documents to the store with Mistral-aware preprocessing"""
+        # Preprocess documents using Mistral tokenizer for consistency
+        processed_documents = []
+        for doc in documents:
+            # Tokenize and decode to normalize text format
+            tokens = self.mistral_tokenizer.encode(doc, max_length=2048, truncation=True)
+            normalized_doc = self.mistral_tokenizer.decode(tokens, skip_special_tokens=True)
+            processed_documents.append(normalized_doc)
+        
+        self.documents.extend(processed_documents)
+        
+        # Handle metadata
+        if metadata:
+            self.document_metadata.extend(metadata)
+        else:
+            # Add default metadata
+            default_metadata = [{"index": len(self.documents) + i, "source": "unknown"} 
+                              for i in range(len(processed_documents))]
+            self.document_metadata.extend(default_metadata)
+        
+        # Generate embeddings for processed documents
+        new_embeddings = self.embedding_model.encode(processed_documents)
+        
+        if self.embeddings is None:
+            self.embeddings = new_embeddings
+        else:
+            self.embeddings = np.vstack([self.embeddings, new_embeddings])
+            
+        # Build FAISS index
+        self._build_index()
+        logger.info(f"Added {len(processed_documents)} documents. Total: {len(self.documents)}")
+        
+    def _build_index(self):
+        """Build FAISS index for fast similarity search"""
+        dimension = self.embeddings.shape[1]
+        self.index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(self.embeddings)
+        self.index.add(self.embeddings.astype('float32'))
+        
+    def retrieve(self, query: str, top_k: int = 5) -> List[Tuple[str, float, Dict]]:
+        """Retrieve top-k most similar documents with metadata"""
+        if self.index is None:
+            return []
+        
+        # Preprocess query using Mistral tokenizer for consistency
+        query_tokens = self.mistral_tokenizer.encode(query, max_length=512, truncation=True)
+        normalized_query = self.mistral_tokenizer.decode(query_tokens, skip_special_tokens=True)
+            
+        query_embedding = self.embedding_model.encode([normalized_query])
+        faiss.normalize_L2(query_embedding)
+        
+        scores, indices = self.index.search(query_embedding.astype('float32'), top_k)
+        
+        results = []
+        for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+            if idx < len(self.documents):
+                metadata = self.document_metadata[idx] if idx < len(self.document_metadata) else {}
+                results.append((self.documents[idx], float(score), metadata))
+                
+        return results
+    
+    def save(self, filepath: str):
+        """Save document store to disk"""
+        data = {
+            'documents': self.documents,
+            'document_metadata': self.document_metadata,
+            'embeddings': self.embeddings,
+            'mistral_model_name': getattr(self, 'mistral_model_name', 'mistralai/Mistral-7B-Instruct-v0.2')
+        }
+        with open(filepath, 'wb') as f:
+            pickle.dump(data, f)
+            
+    def load(self, filepath: str):
+        """Load document store from disk"""
+        with open(filepath, 'rb') as f:
+            data = pickle.load(f)
+        self.documents = data['documents']
+        self.document_metadata = data.get('document_metadata', [])
+        self.embeddings = data['embeddings']
+        
+        # Reinitialize Mistral tokenizer
+        mistral_model = data.get('mistral_model_name', 'mistralai/Mistral-7B-Instruct-v0.2')
+        self.mistral_tokenizer = AutoTokenizer.from_pretrained(mistral_model)
+        if self.mistral_tokenizer.pad_token is None:
+            self.mistral_tokenizer.pad_token = self.mistral_tokenizer.eos_token
+            
+        self._build_index()
 
-class LocalPersonalFileAgent:
-    def __init__(self, folder_path: str, person_name: str, model_name: str = "microsoft/DialoGPT-medium"):
+class RAGGenerator:
+    """Handles text generation using retrieved context with Mistral/Mixtral models"""
+    
+    def __init__(self, model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"):
         """
-        Initialize the Local Personal File Agent
-        
-        Args:
-            folder_path: Path to the folder containing files to index
-            person_name: Name of the person this agent represents  
-            model_name: HuggingFace model name for the LLM (default: DialoGPT-medium)
+        Initialize with Mistral/Mixtral models:
+        - mistralai/Mistral-7B-Instruct-v0.2 (7B parameters, fast inference)
+        - mistralai/Mixtral-8x7B-Instruct-v0.1 (8x7B MoE, higher quality)
         """
-        self.folder_path = Path(folder_path)
-        self.person_name = person_name
         self.model_name = model_name
         
-        # Initialize local LLM
-        print("Loading local language model...")
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device: {self.device}")
+        # Load tokenizer and model
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         
-        # Configure model for efficient loading
-        if self.device == "cuda":
-            # Use 8-bit quantization to reduce memory usage
-            quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0
-            )
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side='left')
+        # Load model with appropriate settings for large models
+        if "Mixtral" in model_name:
+            # Mixtral 8x7B requires more memory management
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                quantization_config=quantization_config,
-                device_map="auto",
-                torch_dtype=torch.float16
+                torch_dtype=torch.float16,  # Use half precision to save memory
+                device_map="auto",  # Automatically distribute across GPUs if available
+                load_in_8bit=True,  # Use 8-bit quantization to reduce memory
+                trust_remote_code=True
             )
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side='left')
-            self.model = AutoModelForCausalLM.from_pretrained(model_name)
+            # Mistral 7B can run with standard settings
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True
+            )
         
-        # Set pad token if not exists
+        # Set padding token
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Set model to evaluation mode
+        self.model.eval()
+        
+        logger.info(f"Loaded {model_name} successfully")
             
-        # Initialize ChromaDB for vector storage with local embeddings
-        self.chroma_client = chromadb.PersistentClient(path=f"./chroma_db_{person_name}")
-        self.collection_name = f"{person_name}_files"
+    def generate_response(self, query: str, context_docs: List[str], max_new_tokens: int = 256) -> str:
+        """Generate response using query and retrieved context with Mistral/Mixtral"""
         
-        # Initialize local embedding function
-        self.embedding_function = LocalEmbeddingFunction()
+        # Prepare context from retrieved documents
+        context = "\n\n".join(context_docs[:3])  # Use top 3 documents
         
-        # Get or create collection
-        try:
-            self.collection = self.chroma_client.get_collection(
-                name=self.collection_name
-            )
-        except:
-            self.collection = self.chroma_client.create_collection(
-                name=self.collection_name
-            )
+        # Create Mistral-style instruction prompt with token length awareness
+        prompt = f"""<s>[INST] Use the following context to answer the question. Be concise and accurate.
+
+Context:
+{context}
+
+Question: {query} [/INST]"""
         
-        # Text splitter for chunking documents
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len
+        # Check prompt length and truncate context if needed
+        prompt_tokens = self.tokenizer.encode(prompt)
+        max_context_tokens = 1800  # Leave room for response
+        
+        if len(prompt_tokens) > max_context_tokens:
+            # Truncate context while keeping the instruction format
+            context_tokens = self.tokenizer.encode(context)
+            available_tokens = max_context_tokens - 200  # Reserve for instruction template
+            truncated_context = self.tokenizer.decode(context_tokens[:available_tokens], skip_special_tokens=True)
+            
+            prompt = f"""<s>[INST] Use the following context to answer the question. Be concise and accurate.
+
+Context:
+{truncated_context}
+
+Question: {query} [/INST]"""
+        
+        # Tokenize with attention to max length
+        inputs = self.tokenizer(
+            prompt, 
+            return_tensors="pt",
+            max_length=2048,  # Mistral max context length
+            truncation=True,
+            padding=True
         )
         
-        # Supported file extensions
-        self.supported_extensions = {'.txt', '.md', '.py', '.js', '.html', '.css', 
-                                   '.json', '.xml', '.csv', '.pdf', '.docx', '.log'}
+        # Move inputs to same device as model
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
         
-        # File hash tracking for updates
-        self.file_hashes = self.load_file_hashes()
-        
-        print("Local Personal File Agent initialized successfully!")
-        
-    def load_file_hashes(self) -> Dict[str, str]:
-        """Load existing file hashes to track changes"""
-        hash_file = Path(f"file_hashes_{self.person_name}.json")
-        if hash_file.exists():
-            with open(hash_file, 'r') as f:
-                return json.load(f)
-        return {}
-    
-    def save_file_hashes(self):
-        """Save file hashes to track changes"""
-        hash_file = Path(f"file_hashes_{self.person_name}.json")
-        with open(hash_file, 'w') as f:
-            json.dump(self.file_hashes, f)
-    
-    def get_file_hash(self, file_path: Path) -> str:
-        """Calculate MD5 hash of a file"""
-        hash_md5 = hashlib.md5()
-        try:
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    hash_md5.update(chunk)
-            return hash_md5.hexdigest()
-        except:
-            return ""
-    
-    def load_document(self, file_path: Path) -> str:
-        """Load content from various file types"""
-        try:
-            file_ext = file_path.suffix.lower()
+        # Generate response
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=0.7,
+                top_p=0.9,  # Nucleus sampling for better quality
+                top_k=50,   # Top-k sampling
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                repetition_penalty=1.1,  # Reduce repetition
+                no_repeat_ngram_size=3   # Prevent 3-gram repetition
+            )
             
-            if file_ext == '.pdf':
-                with open(file_path, 'rb') as file:
-                    reader = PyPDF2.PdfReader(file)
-                    text = ""
-                    for page in reader.pages:
-                        text += page.extract_text()
-                    return text
-                        
-            elif file_ext == '.docx':
-                doc = Document(file_path)
-                return '\n'.join([paragraph.text for paragraph in doc.paragraphs])
-                
-            else:
-                # For text-based files
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
-                    return file.read()
-                    
-        except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            return ""
+        # Decode response
+        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Extract only the generated part (after the prompt)
+        if "[/INST]" in generated_text:
+            # For Mistral format, extract after [/INST]
+            response = generated_text.split("[/INST]")[-1].strip()
+        else:
+            # Fallback: extract after the original prompt
+            response = generated_text[len(prompt):].strip()
+        
+        # Clean up response
+        response = self._clean_response(response)
+        
+        return response
     
-    def process_files(self):
-        """Process all files in the folder and add them to the vector database"""
-        print(f"Processing files for {self.person_name}...")
+    def _clean_response(self, response: str) -> str:
+        """Clean and post-process the generated response"""
+        # Remove any remaining special tokens or artifacts
+        response = response.replace("<s>", "").replace("</s>", "")
         
-        files_processed = 0
-        files_updated = 0
+        # Remove excessive whitespace
+        response = " ".join(response.split())
         
-        for file_path in self.folder_path.rglob('*'):
-            if not file_path.is_file():
-                continue
-                
-            if file_path.suffix.lower() not in self.supported_extensions:
-                continue
-                
-            # Check if file has been modified
-            current_hash = self.get_file_hash(file_path)
-            file_key = str(file_path.relative_to(self.folder_path))
+        # Truncate at natural sentence boundaries if too long
+        sentences = response.split('. ')
+        if len(sentences) > 1 and len(response) > 500:
+            # Keep first few sentences if response is too long
+            response = '. '.join(sentences[:3]) + '.'
+        
+        # Ensure response ends properly
+        if response and not response.endswith(('.', '!', '?')):
+            response += '.'
             
-            if file_key in self.file_hashes and self.file_hashes[file_key] == current_hash:
-                continue  # File hasn't changed, skip
+        return response
+    
+    def generate_with_conversation_history(self, query: str, context_docs: List[str], 
+                                         conversation_history: List[Dict], max_new_tokens: int = 256) -> str:
+        """Generate response considering conversation history"""
+        
+        # Prepare context
+        context = "\n\n".join(context_docs[:3])
+        
+        # Build conversation context
+        conversation_context = ""
+        if conversation_history:
+            recent_history = conversation_history[-3:]  # Last 3 exchanges
+            for item in recent_history:
+                conversation_context += f"Q: {item['query']}\nA: {item['response']}\n\n"
+        
+        # Create enhanced prompt with history
+        prompt = f"""<s>[INST] Use the following context and conversation history to answer the question. Be concise and accurate.
+
+Context:
+{context}
+
+Previous Conversation:
+{conversation_context}
+
+Current Question: {query} [/INST]"""
+        
+        # Use similar generation logic as main method
+        inputs = self.tokenizer(
+            prompt, 
+            return_tensors="pt",
+            max_length=3072,  # Longer for conversation history
+            truncation=True,
+            padding=True
+        )
+        
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=0.7,
+                top_p=0.9,
+                top_k=50,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=3
+            )
             
-            # Load and process the file
-            content = self.load_document(file_path)
-            if not content.strip():
-                continue
-                
-            # Split content into chunks
-            chunks = self.text_splitter.split_text(content)
+        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = generated_text.split("[/INST]")[-1].strip()
+        response = self._clean_response(response)
+        
+        return response
+
+class TTSEngine:
+    """Text-to-Speech engine with multiple backends"""
+    
+    def __init__(self, engine_type: str = "gtts"):
+        self.engine_type = engine_type
+        
+        if engine_type == "pyttsx3":
+            self.tts_engine = pyttsx3.init()
+            self._setup_pyttsx3()
+        elif engine_type == "gtts":
+            pygame.mixer.init()
             
-            # Remove old entries for this file if they exist
+    def _setup_pyttsx3(self):
+        """Setup pyttsx3 engine parameters"""
+        voices = self.tts_engine.getProperty('voices')
+        if voices:
+            self.tts_engine.setProperty('voice', voices[0].id)
+        self.tts_engine.setProperty('rate', 150)
+        self.tts_engine.setProperty('volume', 0.9)
+        
+    def speak(self, text: str, language: str = 'en') -> Optional[bytes]:
+        """Convert text to speech and play/return audio"""
+        if self.engine_type == "pyttsx3":
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()
+            return None
+            
+        elif self.engine_type == "gtts":
             try:
-                existing_docs = self.collection.get(where={"file_path": file_key})
-                if existing_docs['ids']:
-                    self.collection.delete(ids=existing_docs['ids'])
-            except:
-                pass
-            
-            # Generate embeddings for chunks
-            print(f"Processing {file_path.name}...")
-            chunk_embeddings = self.embedding_function(chunks)
-            
-            # Add new chunks to the collection
-            for i, (chunk, embedding) in enumerate(zip(chunks, chunk_embeddings)):
-                doc_id = f"{file_key}_chunk_{i}"
-                metadata = {
-                    "file_path": file_key,
-                    "file_name": file_path.name,
-                    "file_type": file_path.suffix.lower(),
-                    "chunk_index": i,
-                    "person": self.person_name,
-                    "last_modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
-                }
+                tts = gTTS(text=text, lang=language, slow=False)
+                audio_buffer = io.BytesIO()
+                tts.write_to_fp(audio_buffer)
+                audio_buffer.seek(0)
                 
-                self.collection.add(
-                    documents=[chunk],
-                    metadatas=[metadata],
-                    ids=[doc_id],
-                    embeddings=[embedding]
-                )
-            
-            # Update file hash
-            self.file_hashes[file_key] = current_hash
-            files_processed += 1
-            if file_key in self.file_hashes:
-                files_updated += 1
+                # Play audio using pygame
+                pygame.mixer.music.load(audio_buffer)
+                pygame.mixer.music.play()
                 
-            print(f"✓ Processed: {file_path.name}")
-        
-        self.save_file_hashes()
-        print(f"Processing complete! {files_processed} files processed, {files_updated} updated.")
+                # Wait for audio to finish
+                while pygame.mixer.music.get_busy():
+                    pygame.time.wait(100)
+                    
+                return audio_buffer.getvalue()
+                
+            except Exception as e:
+                logger.error(f"TTS error: {e}")
+                return None
+                
+    def save_audio(self, text: str, filepath: str, language: str = 'en'):
+        """Save speech audio to file"""
+        if self.engine_type == "gtts":
+            tts = gTTS(text=text, lang=language, slow=False)
+            tts.save(filepath)
+        else:
+            logger.warning("Audio saving only supported with gTTS engine")
+
+class RAGTTSSystem:
+    """Complete RAG-based Text-to-Speech system with Mistral integration"""
     
-    def search_files(self, query: str, n_results: int = 5) -> List[Dict[str, Any]]:
-        """Search through the indexed files using local embeddings"""
-        # Generate embedding for the query
-        query_embedding = self.embedding_function([query])[0]
+    def __init__(self, 
+                 embedding_model: str = "all-MiniLM-L6-v2",
+                 mistral_model: str = "mistralai/Mistral-7B-Instruct-v0.2",
+                 tts_engine: str = "gtts"):
         
-        # Search in ChromaDB
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results
-        )
+        # Initialize all components with consistent Mistral model
+        self.document_store = DocumentStore(embedding_model, mistral_model)
+        self.rag_generator = RAGGenerator(mistral_model)
+        self.tts_engine = TTSEngine(tts_engine)
         
-        search_results = []
-        if results['ids'][0]:  # Check if we have results
-            for i in range(len(results['ids'][0])):
-                search_results.append({
-                    'content': results['documents'][0][i],
-                    'metadata': results['metadatas'][0][i],
-                    'distance': results['distances'][0][i] if 'distances' in results else None
-                })
+        # Store model info for reference
+        self.mistral_model = mistral_model
+        self.embedding_model = embedding_model
         
-        return search_results
-    
-    def generate_response_local(self, query: str, context_results: List[Dict[str, Any]]) -> str:
-        """Generate a response using the local LLM"""
+        self.conversation_history = []
         
-        # Prepare context from search results
-        context_text = ""
-        file_names = set()
+        logger.info(f"RAGTTSSystem initialized with:")
+        logger.info(f"  - Embedding model: {embedding_model}")
+        logger.info(f"  - Generation model: {mistral_model}")
+        logger.info(f"  - TTS engine: {tts_engine}")
         
-        for result in context_results[:3]:  # Limit context to avoid token limits
-            file_names.add(result['metadata']['file_name'])
-            content = result['content'][:300] + "..." if len(result['content']) > 300 else result['content']
-            context_text += f"\nFrom {result['metadata']['file_name']}:\n{content}\n"
+    def add_knowledge_base(self, documents: List[str], metadata: Optional[List[Dict]] = None):
+        """Add documents to the knowledge base"""
+        self.document_store.add_documents(documents, metadata)
         
-        # Create a focused prompt for the local model
-        prompt = f"""Context from {self.person_name}'s files:
-{context_text}
-
-Question: {query}
-
-Based on the files mentioned above, here's what I found:"""
-
-        try:
-            # Tokenize input
-            inputs = self.tokenizer.encode(prompt, return_tensors="pt", max_length=512, truncation=True)
+    def load_knowledge_from_file(self, filepath: str):
+        """Load knowledge base from text file"""
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
             
-            if self.device == "cuda":
-                inputs = inputs.to(self.device)
+        # Split into chunks (simple approach - can be improved)
+        chunks = self._split_text(content)
+        self.add_knowledge_base(chunks)
+        
+    def _split_text(self, text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
+        """Split text into overlapping chunks using Mistral tokenizer for accurate length"""
+        # Use Mistral tokenizer to get accurate token count
+        tokenizer = self.document_store.mistral_tokenizer
+        
+        # Tokenize the entire text
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        
+        chunks = []
+        start_idx = 0
+        
+        while start_idx < len(tokens):
+            # Define chunk end
+            end_idx = min(start_idx + chunk_size, len(tokens))
             
-            # Generate response
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    inputs,
-                    max_new_tokens=150,
-                    num_return_sequences=1,
-                    temperature=0.7,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    attention_mask=torch.ones_like(inputs)
+            # Extract chunk tokens
+            chunk_tokens = tokens[start_idx:end_idx]
+            
+            # Decode back to text
+            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            
+            if chunk_text.strip():
+                chunks.append(chunk_text.strip())
+            
+            # Move start index with overlap
+            start_idx = end_idx - overlap
+            
+            # Break if we're at the end
+            if end_idx >= len(tokens):
+                break
+                
+        logger.info(f"Split text into {len(chunks)} chunks using Mistral tokenizer")
+        return chunks
+        
+    def query_with_voice(self, query: str, speak: bool = True, save_audio: Optional[str] = None) -> Dict:
+        """Process query and return both text and audio response"""
+        logger.info(f"Processing query: {query}")
+        
+        # Retrieve relevant documents
+        retrieved_docs = self.document_store.retrieve(query, top_k=5)
+        
+        if not retrieved_docs:
+            response_text = "I don't have enough information to answer your question."
+        else:
+            # Extract document texts (now includes metadata)
+            doc_texts = [doc for doc, score, metadata in retrieved_docs]
+            doc_metadata = [metadata for doc, score, metadata in retrieved_docs]
+            
+            # Generate response with conversation history if available
+            if hasattr(self.rag_generator, 'generate_with_conversation_history'):
+                response_text = self.rag_generator.generate_with_conversation_history(
+                    query, doc_texts, self.conversation_history
                 )
+            else:
+                response_text = self.rag_generator.generate_response(query, doc_texts)
             
-            # Decode response
-            full_response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Store in conversation history with enhanced metadata
+        self.conversation_history.append({
+            'timestamp': datetime.now().isoformat(),
+            'query': query,
+            'response': response_text,
+            'retrieved_docs': len(retrieved_docs),
+            'model_used': self.mistral_model,
+            'doc_scores': [score for doc, score, metadata in retrieved_docs] if retrieved_docs else []
+        })
+        
+        # Convert to speech
+        audio_data = None
+        if speak:
+            audio_data = self.tts_engine.speak(response_text)
             
-            # Extract only the generated part (after the prompt)
-            response = full_response[len(prompt):].strip()
+        # Save audio if requested
+        if save_audio:
+            self.tts_engine.save_audio(response_text, save_audio)
             
-            # Add file references if response is too short or generic
-            if len(response) < 20 or not response:
-                if file_names:
-                    response = f"Based on the information in {', '.join(file_names)}, I found relevant content. However, you may want to check these files directly for more detailed information."
-                else:
-                    response = "I couldn't find specific information about that in the available files."
+        return {
+            'query': query,
+            'response_text': response_text,
+            'retrieved_documents': retrieved_docs,
+            'audio_generated': speak,
+            'audio_saved': save_audio is not None,
+            'audio_data': audio_data
+        }
+        
+    def batch_process_queries(self, queries: List[str], output_dir: str = "audio_responses"):
+        """Process multiple queries and save audio responses"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        results = []
+        for i, query in enumerate(queries):
+            audio_path = os.path.join(output_dir, f"response_{i+1}.mp3")
+            result = self.query_with_voice(query, speak=False, save_audio=audio_path)
+            results.append(result)
             
-            return response
+        return results
+        
+    def save_system_state(self, filepath: str):
+        """Save the complete system state"""
+        self.document_store.save(f"{filepath}_docs.pkl")
+        
+        # Save system configuration and history
+        system_data = {
+            'mistral_model': self.mistral_model,
+            'embedding_model': self.embedding_model,
+            'conversation_history': self.conversation_history
+        }
+        
+        with open(f"{filepath}_system.json", 'w') as f:
+            json.dump(system_data, f, indent=2)
             
-        except Exception as e:
-            return f"Error generating response: {e}"
-    
-    def ask(self, question: str) -> str:
-        """Main method to ask questions about the person's files"""
-        print(f"🔍 Searching {self.person_name}'s files for: {question}")
+    def load_system_state(self, filepath: str):
+        """Load the complete system state"""
+        self.document_store.load(f"{filepath}_docs.pkl")
         
-        # Search for relevant content
-        search_results = self.search_files(question, n_results=5)
-        
-        if not search_results:
-            return f"I couldn't find any relevant information in {self.person_name}'s files for your question."
-        
-        # Show which files were found
-        found_files = set(result['metadata']['file_name'] for result in search_results)
-        print(f"📁 Found relevant content in: {', '.join(found_files)}")
-        
-        # Generate response using local LLM
-        response = self.generate_response_local(question, search_results)
-        
-        return response
-    
-    def list_files(self) -> List[str]:
-        """List all indexed files"""
         try:
-            all_docs = self.collection.get()
-            files = set()
-            for metadata in all_docs['metadatas']:
-                files.add(metadata['file_name'])
-            return sorted(list(files))
-        except:
-            return []
-    
-    def get_file_summary(self) -> str:
-        """Get a summary of indexed files"""
-        files = self.list_files()
-        file_count = len(files)
-        
-        # Get file type distribution
-        file_types = {}
-        try:
-            all_docs = self.collection.get()
-            for metadata in all_docs['metadatas']:
-                file_type = metadata.get('file_type', 'unknown')
-                file_types[file_type] = file_types.get(file_type, 0) + 1
-        except:
-            pass
-        
-        summary = f"🤖 Local Personal Agent for {self.person_name}\n"
-        summary += f"📊 Total files indexed: {file_count}\n"
-        summary += f"📋 File types: {', '.join([f'{k}: {v}' for k, v in file_types.items()])}\n"
-        summary += f"🧠 Using local model: {self.model_name}\n"
-        summary += f"💻 Device: {self.device}\n"
-        
-        return summary
-    
-    def cleanup(self):
-        """Clean up resources"""
-        if hasattr(self, 'model'):
-            del self.model
-        if hasattr(self, 'tokenizer'):
-            del self.tokenizer
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-
-# Lightweight alternative using a smaller model
-class LightweightLocalAgent(LocalPersonalFileAgent):
-    """A lighter version using smaller models for lower-end hardware"""
-    
-    def __init__(self, folder_path: str, person_name: str):
-        # Use smaller, faster models
-        print("Initializing lightweight local agent...")
-        self.folder_path = Path(folder_path)
-        self.person_name = person_name
-        
-        # Initialize ChromaDB with local embeddings
-        self.chroma_client = chromadb.PersistentClient(path=f"./chroma_db_{person_name}")
-        self.collection_name = f"{person_name}_files"
-        
-        # Use a smaller embedding model
-        self.embedding_function = LocalEmbeddingFunction("all-MiniLM-L6-v2")
-        
-        # Get or create collection
-        try:
-            self.collection = self.chroma_client.get_collection(name=self.collection_name)
-        except:
-            self.collection = self.chroma_client.create_collection(name=self.collection_name)
-        
-        # Text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=100
-        )
-        
-        # Supported extensions
-        self.supported_extensions = {'.txt', '.md', '.py', '.js', '.html', '.css', 
-                                   '.json', '.xml', '.csv', '.pdf', '.docx', '.log'}
-        
-        # File hashes
-        self.file_hashes = self.load_file_hashes()
-        
-        print("Lightweight agent ready!")
-    
-    def generate_response_simple(self, query: str, context_results: List[Dict[str, Any]]) -> str:
-        """Generate a simple template-based response without heavy LLM"""
-        if not context_results:
-            return f"No relevant information found in {self.person_name}'s files."
-        
-        # Extract key information
-        relevant_files = []
-        key_content = []
-        
-        for result in context_results[:3]:
-            file_name = result['metadata']['file_name']
-            content = result['content'][:200].strip()
+            with open(f"{filepath}_system.json", 'r') as f:
+                system_data = json.load(f)
+            self.conversation_history = system_data.get('conversation_history', [])
             
-            relevant_files.append(file_name)
-            key_content.append(f"From {file_name}: {content}")
-        
-        response = f"Found information in {len(relevant_files)} file(s): {', '.join(set(relevant_files))}\n\n"
-        response += "Key content:\n" + '\n\n'.join(key_content)
-        
-        return response
-    
-    def ask(self, question: str) -> str:
-        """Simplified ask method without heavy LLM processing"""
-        print(f"🔍 Searching {self.person_name}'s files for: {question}")
-        
-        search_results = self.search_files(question, n_results=5)
-        response = self.generate_response_simple(question, search_results)
-        
-        return response
+            # Verify model compatibility
+            if system_data.get('mistral_model') != self.mistral_model:
+                logger.warning(f"Model mismatch: loaded {system_data.get('mistral_model')}, "
+                             f"current {self.mistral_model}")
+                             
+        except FileNotFoundError:
+            logger.warning("No system state file found")
+            
+    def get_system_info(self) -> Dict:
+        """Get detailed system information"""
+        return {
+            'mistral_model': self.mistral_model,
+            'embedding_model': self.embedding_model,
+            'total_documents': len(self.document_store.documents),
+            'total_conversations': len(self.conversation_history),
+            'mistral_tokenizer_vocab_size': len(self.document_store.mistral_tokenizer.get_vocab()),
+            'embedding_dimension': self.document_store.embeddings.shape[1] if self.document_store.embeddings is not None else 0
+        }
 
-
-# Example usage
+# Demo and usage example
 def main():
-    print("Choose your agent type:")
-    print("1. Full Local Agent (requires more memory, better responses)")
-    print("2. Lightweight Agent (less memory, simpler responses)")
+    """Demo of the RAG-TTS system with Mistral models"""
+    print("Initializing RAG-TTS System with Mistral/Mixtral...")
+    print("Note: First run will download large models (~13-26GB)")
     
-    choice = input("Enter choice (1 or 2): ").strip()
+    # Initialize system with Mistral models
+    rag_tts = RAGTTSSystem(
+        embedding_model="all-MiniLM-L6-v2",
+        mistral_model="mistralai/Mistral-7B-Instruct-v0.2",
+        tts_engine="gtts"  # Use "pyttsx3" for offline TTS
+    )
     
-    # Get user inputs
-    folder_path = input("Enter path to files folder: ").strip()
-    person_name = input("Enter person name: ").strip()
+    # Display system information
+    system_info = rag_tts.get_system_info()
+    print(f"System Configuration:")
+    for key, value in system_info.items():
+        print(f"  - {key}: {value}")
     
-    if choice == "2":
-        # Use lightweight version
-        agent = LightweightLocalAgent(folder_path, person_name)
-    else:
-        # Use full version with local LLM
-        model_name = input("Enter model name (press Enter for default 'microsoft/DialoGPT-medium'): ").strip()
-        if not model_name:
-            model_name = "microsoft/DialoGPT-medium"
-        agent = LocalPersonalFileAgent(folder_path, person_name, model_name)
+    # Sample knowledge base
+    sample_documents = [
+        "Artificial Intelligence is a branch of computer science that aims to create machines that mimic human intelligence.",
+        "Machine learning is a subset of AI that enables computers to learn and make decisions from data without explicit programming.",
+        "Deep learning uses neural networks with multiple layers to model and understand complex patterns in data.",
+        "Natural language processing (NLP) is a field of AI that focuses on the interaction between computers and human language.",
+        "Computer vision is an AI field that trains computers to interpret and understand visual information from the world.",
+        "Robotics combines AI, engineering, and other fields to create machines that can perform tasks autonomously.",
+        "The Turing Test is a measure of a machine's ability to exhibit intelligent behavior equivalent to human intelligence."
+    ]
     
-    # Process files
-    print("\n" + "="*50)
-    agent.process_files()
-    
-    # Print summary
-    print("\n" + agent.get_file_summary())
+    # Add knowledge to the system
+    print("Adding knowledge base...")
+    rag_tts.add_knowledge_base(sample_documents)
     
     # Interactive query loop
-    print("\n" + "="*50)
-    print("Agent ready! Ask questions about the files.")
-    print("Commands: 'files' to list files, 'quit' to exit")
+    print("\nRAG-TTS System Ready!")
+    print("Ask questions about AI, ML, or related topics.")
+    print("Type 'quit' to exit, 'save' to save audio, 'history' to see conversation history")
     
-    try:
-        while True:
-            question = input(f"\n💬 Ask {agent.person_name}'s agent: ").strip()
+    while True:
+        query = input("\nYour question: ").strip()
+        
+        if query.lower() == 'quit':
+            break
+        elif query.lower() == 'history':
+            print("\nConversation History:")
+            for i, item in enumerate(rag_tts.conversation_history, 1):
+                print(f"{i}. Q: {item['query']}")
+                print(f"   A: {item['response'][:100]}...")
+            continue
+        elif query.lower().startswith('save'):
+            # Save last response as audio
+            if rag_tts.conversation_history:
+                last_response = rag_tts.conversation_history[-1]['response']
+                rag_tts.tts_engine.save_audio(last_response, "last_response.mp3")
+                print("Audio saved as 'last_response.mp3'")
+            continue
             
-            if question.lower() == 'quit':
-                break
-            elif question.lower() == 'files':
-                files = agent.list_files()
-                print(f"📁 Indexed files ({len(files)}):")
-                for file in files:
-                    print(f"  • {file}")
-                continue
-            elif not question:
-                continue
-                
-            print("\n🤖 Agent:")
-            response = agent.ask(question)
-            print(response)
+        if query:
+            # Process query with voice output
+            result = rag_tts.query_with_voice(query, speak=True)
             
-    except KeyboardInterrupt:
-        print("\n\nExiting...")
-    finally:
-        if hasattr(agent, 'cleanup'):
-            agent.cleanup()
+            print(f"\nResponse: {result['response_text']}")
+            print(f"Retrieved {len(result['retrieved_documents'])} relevant documents")
 
 if __name__ == "__main__":
+    # Install required packages:
+    # pip install torch transformers sentence-transformers faiss-cpu pyttsx3 gtts pygame numpy accelerate bitsandbytes
+    # 
+    # For GPU support (recommended for Mistral/Mixtral):
+    # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+    #
+    # Hardware Requirements:
+    # - Mistral 7B: 16GB+ RAM/VRAM (8GB with quantization)
+    # - Mixtral 8x7B: 32GB+ RAM/VRAM (16GB with quantization)
     main()
+    
